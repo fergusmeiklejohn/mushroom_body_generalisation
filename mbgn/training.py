@@ -113,6 +113,10 @@ class Trainer:
             self.model_config.n_input = cfg.stimulus_dims
             self.model_config.seed = cfg.model_seed
             model = MBGN(self.model_config)
+            # Calibrate aggregate baseline to this stimulus set (reduces variance)
+            model.calibrate_baseline(training_stimuli)
+            # Bias aggregate pathway for the task type (reduces variance)
+            model.set_aggregate_bias(cfg.task_type.name)
 
         # Save initial state
         initial_state = model.get_state()
@@ -236,6 +240,10 @@ class Trainer:
                     config=self.model_config,
                     **ablation_params
                 )
+                # Calibrate aggregate baseline to this stimulus set (reduces variance)
+                model.calibrate_baseline(training_stimuli)
+                # Bias aggregate pathway for the task type (reduces variance)
+                model.set_aggregate_bias(cfg.task_type.name)
 
                 # Run experiment
                 result = self.run_experiment(

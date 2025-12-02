@@ -44,9 +44,16 @@ class MBGNConfig:
     # Decision
     decision_threshold: float = 0.0  # Threshold for GO decision
 
+    # Reward baseline initialization
+    # Starting at 0.5 (expected for random performance) reduces early trial variance
+    reward_baseline_init: float = 0.5
+
     # Aggregate pathway
     # Baseline should be between "same" (~560) and "different" (~640) aggregate values
     aggregate_baseline: float = 600.0  # Expected aggregate activity (for deviation computation)
+
+    # Relative comparison mode: compare to sample aggregate instead of fixed baseline
+    use_relative_aggregate: bool = True  # If True, use sample aggregate as baseline
 
     # Random seed
     seed: Optional[int] = None
@@ -95,8 +102,11 @@ class MBGN:
         self._init_readout_layers()
         self._init_accommodation()
 
-        # Learning state
-        self.reward_baseline = 0.0
+        # Learning state - start at expected value for random performance
+        self.reward_baseline = self.config.reward_baseline_init
+
+        # Reference aggregate for relative comparison (set by set_sample_reference)
+        self._sample_aggregate = None
 
     def _init_projection_layer(self):
         """Initialize the random sparse projection matrix (Input → Expansion)."""
@@ -132,10 +142,34 @@ class MBGN:
 
         # Aggregate pathway: reads the sum of activity
         # Shape: (n_output,)
+        # Initialize near zero - will be biased by set_aggregate_bias() if needed
         self.W_aggregate = self.rng.normal(
             0, 0.01,
             self.config.n_output
         ).astype(np.float32)
+
+    def set_aggregate_bias(self, task_type: str, strength: float = 0.3):
+        """
+        Bias W_aggregate initialization based on task type.
+
+        This reduces variance by starting the aggregate pathway weight
+        in the correct direction for the task.
+
+        Args:
+            task_type: 'DMTS' or 'DNMTS'
+            strength: Initial weight magnitude (higher = stronger bias)
+        """
+        # For DMTS: same → low aggregate → negative deviation → need negative weight for GO
+        # For DNMTS: different → high aggregate → positive deviation → need positive weight for GO
+        if task_type == 'DMTS':
+            # Low aggregate (same/match) should produce GO (positive output)
+            # Deviation is negative, so weight should be negative
+            self.W_aggregate = np.array([-strength], dtype=np.float32)
+        elif task_type == 'DNMTS':
+            # High aggregate (different/non-match) should produce GO (positive output)
+            # Deviation is positive, so weight should be positive
+            self.W_aggregate = np.array([strength], dtype=np.float32)
+        # else: keep random initialization
 
     def _init_accommodation(self):
         """Initialize accommodation state (one value per expansion unit)."""
@@ -212,7 +246,15 @@ class MBGN:
         # Low aggregate (accommodated/same) → negative deviation
         # High aggregate (novel/different) → positive deviation
         aggregate_activity = sparse_rep.sum()
-        aggregate_deviation = aggregate_activity - self.config.aggregate_baseline
+
+        # Choose baseline: use sample's aggregate if available (relative mode),
+        # otherwise use fixed/calibrated baseline
+        if self.config.use_relative_aggregate and self._sample_aggregate is not None:
+            baseline = self._sample_aggregate
+        else:
+            baseline = self.config.aggregate_baseline
+
+        aggregate_deviation = aggregate_activity - baseline
         out_aggregate = self.W_aggregate * aggregate_deviation  # shape: (n_output,)
 
         # 7. Combine pathways
@@ -247,6 +289,63 @@ class MBGN:
     def reset_accommodation(self):
         """Reset accommodation state to zero."""
         self.accommodation_state = np.zeros(self.config.n_expansion, dtype=np.float32)
+
+    def set_sample_reference(self, aggregate: float):
+        """
+        Set the sample's aggregate activity as reference for relative comparison.
+
+        Call this after the sample presentation, before choice presentations.
+
+        Args:
+            aggregate: The sample's aggregate activity
+        """
+        self._sample_aggregate = aggregate
+
+    def clear_sample_reference(self):
+        """Clear the sample reference (call at trial start)."""
+        self._sample_aggregate = None
+
+    def calibrate_baseline(self, stimuli: list, delay: float = 1.0):
+        """
+        Calibrate aggregate_baseline based on actual stimulus characteristics.
+
+        This measures the midpoint between "same" (accommodated) and "different"
+        (fresh) aggregate activity for the given stimuli, and sets the baseline
+        accordingly. This improves generalization to different stimulus sets.
+
+        Args:
+            stimuli: List of Stimulus objects to use for calibration
+            delay: Delay between sample and test presentation
+        """
+        same_aggregates = []
+        diff_aggregates = []
+
+        for i, stim1 in enumerate(stimuli):
+            for j, stim2 in enumerate(stimuli):
+                # Present sample
+                self.reset_accommodation()
+                self.forward(stim1.vector, update_accommodation=True)
+                self.decay_accommodation(delay)
+
+                # Present test (same or different)
+                result = self.forward(stim2.vector, update_accommodation=False)
+
+                if i == j:
+                    same_aggregates.append(result.aggregate_activity)
+                else:
+                    diff_aggregates.append(result.aggregate_activity)
+
+        # Set baseline to midpoint between same and different
+        same_mean = np.mean(same_aggregates)
+        diff_mean = np.mean(diff_aggregates)
+        self.config.aggregate_baseline = (same_mean + diff_mean) / 2.0
+
+        self.reset_accommodation()
+        return {
+            'same_mean': same_mean,
+            'diff_mean': diff_mean,
+            'baseline': self.config.aggregate_baseline
+        }
 
     def update_weights(
         self,

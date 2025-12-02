@@ -201,16 +201,19 @@ class TaskRunner:
     Runs trials and manages the interaction between model and task.
     """
 
-    def __init__(self, model, task: BaseTask):
+    def __init__(self, model, task: BaseTask, seed: Optional[int] = None):
         """
         Initialize the task runner.
 
         Args:
             model: MBGN model instance
             task: Task instance (DMTS or DNMTS)
+            seed: Random seed for forced choice decisions
         """
         self.model = model
         self.task = task
+        # Separate RNG for forced choice to avoid corrupting trial generation
+        self.forced_choice_rng = np.random.default_rng(seed)
 
     def run_trial(
         self,
@@ -233,10 +236,14 @@ class TaskRunner:
         # previous trials. This matches the biological paradigm where
         # inter-trial intervals are long enough for full recovery.
         self.model.reset_accommodation()
+        self.model.clear_sample_reference()
 
         # === Sample Phase ===
         sample_result = self.model.forward(trial.sample.vector, update_accommodation=True)
         aggregate_after_sample = sample_result.aggregate_activity
+
+        # Set sample's aggregate as reference for relative comparison
+        self.model.set_sample_reference(sample_result.aggregate_activity)
 
         # === Delay Phase ===
         self.model.decay_accommodation(self.task.config.delay_duration)
@@ -267,7 +274,8 @@ class TaskRunner:
                 choice_result = choice2_result
             else:
                 # Neither chosen - forced choice (random)
-                chose_first = self.task.rng.random() < 0.5
+                # Use dedicated RNG to avoid corrupting trial generation RNG
+                chose_first = self.forced_choice_rng.random() < 0.5
                 chose_match = trial.match_is_first if chose_first else not trial.match_is_first
                 choice_result = choice1_result if chose_first else choice2_result
 
@@ -368,9 +376,9 @@ class ExperimentRunner:
             self.training_task = DNMTSTask(training_stimuli, seed=seed)
             self.transfer_task = DNMTSTask(transfer_stimuli, seed=seed)
 
-        # Create runners
-        self.training_runner = TaskRunner(model, self.training_task)
-        self.transfer_runner = TaskRunner(model, self.transfer_task)
+        # Create runners with different seeds for forced choice RNG
+        self.training_runner = TaskRunner(model, self.training_task, seed=seed)
+        self.transfer_runner = TaskRunner(model, self.transfer_task, seed=seed + 1000 if seed else None)
 
     def run_experiment(
         self,
