@@ -9,7 +9,7 @@ Core model implementation with:
 """
 
 import numpy as np
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List
 from dataclasses import dataclass, field
 
 
@@ -434,6 +434,154 @@ class MBGN:
         new_model.W_proj = self.W_proj.copy()
         new_model.set_state(self.get_state())
         return new_model
+
+    # === Numerosity comparison methods ===
+
+    def compare_stimuli(
+        self,
+        stim_a: np.ndarray,
+        stim_b: np.ndarray,
+        use_accommodation: bool = False
+    ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Compare two stimuli and return which has higher aggregate activity.
+
+        This method is designed for numerosity comparison tasks where
+        we want to determine which stimulus has more elements based on
+        aggregate activity in the expansion layer.
+
+        Args:
+            stim_a: First stimulus vector (n_input,)
+            stim_b: Second stimulus vector (n_input,)
+            use_accommodation: Whether to apply accommodation (default False)
+                             For numerosity, accommodation should typically be
+                             disabled for clean comparison.
+
+        Returns:
+            Tuple of (choice, info) where:
+                choice: 'A' if stim_a has higher aggregate, 'B' otherwise
+                info: Dictionary with aggregate values and comparison details
+        """
+        # Save accommodation state if we're temporarily disabling it
+        if not use_accommodation:
+            old_accommodation = self.accommodation_state.copy()
+            self.accommodation_state = np.zeros_like(self.accommodation_state)
+
+        # Process stimulus A
+        result_a = self.forward(stim_a, update_accommodation=use_accommodation)
+        aggregate_a = result_a.aggregate_activity
+
+        # Process stimulus B
+        result_b = self.forward(stim_b, update_accommodation=use_accommodation)
+        aggregate_b = result_b.aggregate_activity
+
+        # Restore accommodation state if we disabled it
+        if not use_accommodation:
+            self.accommodation_state = old_accommodation
+
+        # Decision based on aggregate comparison
+        if aggregate_a > aggregate_b:
+            choice = 'A'
+        elif aggregate_b > aggregate_a:
+            choice = 'B'
+        else:
+            # Tie (unlikely but possible)
+            choice = 'A'  # Default to A on tie
+
+        return choice, {
+            'aggregate_a': aggregate_a,
+            'aggregate_b': aggregate_b,
+            'aggregate_diff': aggregate_a - aggregate_b,
+            'sparse_rep_a': result_a.sparse_rep,
+            'sparse_rep_b': result_b.sparse_rep,
+        }
+
+    def forward_numerosity(
+        self,
+        x: np.ndarray,
+        use_accommodation: bool = False
+    ) -> ForwardResult:
+        """
+        Forward pass optimized for numerosity comparison.
+
+        This is a convenience method that temporarily disables accommodation
+        for clean numerosity signal, then restores state.
+
+        Args:
+            x: Input stimulus vector (n_input,)
+            use_accommodation: Whether to apply accommodation (default False)
+
+        Returns:
+            ForwardResult with decision and internal states
+        """
+        if use_accommodation:
+            return self.forward(x, update_accommodation=True)
+
+        # Disable accommodation temporarily
+        old_accommodation = self.accommodation_state.copy()
+        self.accommodation_state = np.zeros_like(self.accommodation_state)
+
+        result = self.forward(x, update_accommodation=False)
+
+        # Restore accommodation state
+        self.accommodation_state = old_accommodation
+
+        return result
+
+    def verify_numerosity_signal(
+        self,
+        numerosities: list,
+        stimulus_generator,
+        n_samples: int = 50
+    ) -> Dict[str, Any]:
+        """
+        Verify that aggregate activity correlates with numerosity.
+
+        This is a diagnostic method to check whether the random projection
+        preserves the numerosity signal before running experiments.
+
+        Args:
+            numerosities: List of numerosity values to test
+            stimulus_generator: NumerosityStimulusGenerator instance
+            n_samples: Number of samples per numerosity
+
+        Returns:
+            Dictionary with correlation statistics
+        """
+        aggregates = []
+        nums = []
+
+        for n in numerosities:
+            for _ in range(n_samples):
+                stim = stimulus_generator.make_stimulus(n)
+                result = self.forward_numerosity(stim.vector, use_accommodation=False)
+                aggregates.append(result.aggregate_activity)
+                nums.append(n)
+
+        aggregates = np.array(aggregates)
+        nums = np.array(nums)
+
+        # Compute correlation
+        correlation = np.corrcoef(nums, aggregates)[0, 1]
+
+        # Compute mean aggregate per numerosity
+        mean_by_num = {n: np.mean(aggregates[nums == n]) for n in numerosities}
+        std_by_num = {n: np.std(aggregates[nums == n]) for n in numerosities}
+
+        # Check monotonicity
+        means_ordered = [mean_by_num[n] for n in sorted(numerosities)]
+        is_monotonic = all(
+            means_ordered[i] <= means_ordered[i+1]
+            for i in range(len(means_ordered)-1)
+        )
+
+        return {
+            'correlation': correlation,
+            'mean_by_numerosity': mean_by_num,
+            'std_by_numerosity': std_by_num,
+            'is_monotonic': is_monotonic,
+            'n_samples': n_samples * len(numerosities)
+        }
 
 
 class AblatedMBGN(MBGN):
